@@ -19,7 +19,16 @@ PORT = int(os.environ.get("PORT", 10000))
 raw_creator_id = os.environ.get("CRISTIAN_USER_ID", "").strip()
 CRISTIAN_USER_ID = int(raw_creator_id) if raw_creator_id.isdigit() else None
 
-DEFAULT_GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+DEFAULT_GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-4-hydrogen").strip() or "gemini-4-hydrogen"
+
+FALLBACK_GEMINI_MODELS = [
+    "gemini-4-hydrogen",
+    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-4-neon",
+    "gemini-4-argon",
+    "gemini-4-carbon",
+]
 
 ALLOWED_REACTIONS = {"👍", "❤️", "🔥", "😂", "😮", "😢", "👏", "🤔", "👀", "💯", "🎉", "🫡"}
 
@@ -40,7 +49,7 @@ def log_error(context_tag: str, err: Exception | str):
 
 
 def format_detailed_error(err: Exception | str, include_tb: bool = False, max_len: int = 3200) -> str:
-    """Devuelve el error exacto con su tipo de excepción y detalle sin recortar lo importante."""
+    """Devuelve el error exacto con su tipo de excepción y detalle."""
     if isinstance(err, BaseException):
         exc_type = type(err).__name__
         exc_msg = str(err).strip() or "(sin mensaje)"
@@ -106,11 +115,30 @@ def _supports_content_generation(model_obj) -> bool:
     return True
 
 
-async def scan_available_gemini_models(verify_ping: bool = False) -> list[str]:
-    """Escanea los modelos de la API y conserva solo los disponibles."""
+async def _probe_models_availability(candidates: list[str]) -> list[str]:
+    """Comprueba qué modelos responden correctamente a generate_content y conserva solo los disponibles."""
+    working: list[str] = []
+    for candidate in candidates:
+        try:
+            await client.aio.models.generate_content(
+                model=candidate,
+                contents="responde solo OK",
+                config=types.GenerateContentConfig(max_output_tokens=8, temperature=0.0),
+            )
+            working.append(candidate)
+        except Exception as e_probe:
+            log_error(f"probe_model:{candidate}", e_probe)
+            LAST_SCAN_ERRORS.append(f"{candidate} -> {format_detailed_error(e_probe, include_tb=False)}")
+            continue
+    return working
+
+
+async def scan_available_gemini_models(verify_ping: bool = True) -> list[str]:
+    """Escanea los modelos de la API; si models.list da 501 o falla, prueba los candidatos actuales y deja solo los disponibles."""
     LAST_SCAN_ERRORS.clear()
     discovered: list[str] = []
     seen: set[str] = set()
+    list_failed = False
 
     try:
         pager = await client.aio.models.list()
@@ -122,8 +150,7 @@ async def scan_available_gemini_models(verify_ping: bool = False) -> list[str]:
                 seen.add(model_id)
                 discovered.append(model_id)
     except Exception as e_async:
-        err_async_str = format_detailed_error(e_async, include_tb=False)
-        LAST_SCAN_ERRORS.append(f"aio.models.list -> {err_async_str}")
+        list_failed = True
         log_error("scan_models.aio", e_async)
         try:
             for m in client.models.list():
@@ -133,35 +160,28 @@ async def scan_available_gemini_models(verify_ping: bool = False) -> list[str]:
                 if model_id and model_id not in seen:
                     seen.add(model_id)
                     discovered.append(model_id)
+            list_failed = False
         except Exception as e_sync:
-            err_sync_str = format_detailed_error(e_sync, include_tb=False)
-            LAST_SCAN_ERRORS.append(f"sync.models.list -> {err_sync_str}")
+            list_failed = True
             log_error("scan_models.sync", e_sync)
-            discovered = []
 
-    def sort_key(name: str):
-        is_gemini = 0 if name.startswith("gemini-") else 1
-        flash_rank = 0 if "flash" in name else (1 if "pro" in name else 2)
-        return (is_gemini, flash_rank, name)
+    if list_failed or not discovered:
+        candidates = list(dict.fromkeys([DEFAULT_GEMINI_MODEL] + FALLBACK_GEMINI_MODELS))
+        if verify_ping:
+            discovered = await _probe_models_availability(candidates)
+        else:
+            discovered = candidates
+    else:
+        def sort_key(name: str):
+            is_g4 = 0 if name.startswith("gemini-4") else (1 if name.startswith("gemini-3") else 2)
+            flash_rank = 0 if "hydrogen" in name or "flash" in name else (1 if "argon" in name or "neon" in name else 2)
+            return (is_g4, flash_rank, name)
 
-    discovered.sort(key=sort_key)
-
-    if verify_ping and discovered:
-        verified: list[str] = []
-        for candidate in discovered[:20]:
-            try:
-                await client.aio.models.generate_content(
-                    model=candidate,
-                    contents="responde solo OK",
-                    config=types.GenerateContentConfig(max_output_tokens=8, temperature=0.0),
-                )
-                verified.append(candidate)
-            except Exception as e_ping:
-                log_error(f"ping_model:{candidate}", e_ping)
-                LAST_SCAN_ERRORS.append(f"ping({candidate}) -> {format_detailed_error(e_ping)}")
-                continue
-        if verified:
-            discovered = verified
+        discovered.sort(key=sort_key)
+        if verify_ping:
+            verified = await _probe_models_availability(discovered[:20])
+            if verified:
+                discovered = verified
 
     AVAILABLE_GEMINI_MODELS.clear()
     AVAILABLE_GEMINI_MODELS.extend(discovered)
@@ -359,7 +379,7 @@ async def cmd_ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Guía de comandos de Jaison (Modo Creador - Cristian):\n\n"
             "• /ayuda o /help — Muestra esta lista de comandos y ejemplos de uso.\n"
             "• /estado — Revisa modo del chat, modelo activo, mensajes observados, stickers y ajustes.\n"
-            "• /modelos — Escanea y muestra solo los modelos disponibles de la API; usa /modelos <número> para elegir uno.\n"
+            "• /modelos — Escanea y muestra solo los modelos disponibles; usa /modelos <número> para elegir uno.\n"
             "  Ejemplos: /modelos  |  /modelos scan  |  /modelos 1\n"
             "• /modelo <nombre|reset> — Cambia el modelo activo directamente por nombre o vuelve al defecto.\n"
             "• /recuerdos — Lista los recuerdos guardados en la base de datos para este chat.\n"
@@ -392,7 +412,7 @@ async def cmd_modelos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         idx = int(args[0]) - 1
         models = get_cached_available_models()
         if not models:
-            models = await scan_available_gemini_models(verify_ping=False)
+            models = await scan_available_gemini_models(verify_ping=True)
         if idx < 0 or idx >= len(models):
             await update.message.reply_text(
                 f"Número fuera de rango. Usa /modelos para ver la lista del 1 al {len(models)}."
@@ -404,17 +424,17 @@ async def cmd_modelos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     force_scan = len(args) > 0 and args[0].lower() in ("scan", "escanear", "refresh", "actualizar")
-    verify_live = len(args) > 1 and args[1].lower() in ("check", "ping", "test", "verificar")
+    skip_ping = len(args) > 1 and args[1].lower() in ("noprobe", "fast", "rapido")
 
     models = get_cached_available_models()
     if force_scan or not models:
-        await update.message.reply_text("Escaneando modelos disponibles de la API...")
-        models = await scan_available_gemini_models(verify_ping=verify_live)
+        await update.message.reply_text("Escaneando y comprobando modelos disponibles...")
+        models = await scan_available_gemini_models(verify_ping=not skip_ping)
 
     if not models:
-        err_detalle = "\n".join(LAST_SCAN_ERRORS) if LAST_SCAN_ERRORS else "No se devolvió ningún modelo ni detalle adicional."
+        err_detalle = "\n".join(LAST_SCAN_ERRORS) if LAST_SCAN_ERRORS else "Ningún modelo respondió como disponible."
         await update.message.reply_text(
-            f"⚠️ Error al escanear modelos:\n{err_detalle}"
+            f"⚠️ Error al escanear modelos disponibles:\n{err_detalle}"
         )
         return
 
@@ -440,8 +460,8 @@ async def cmd_modelo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not context.args:
         await update.message.reply_text(
-            f"Modelo actual de Gemini: {actual}\n\n"
-            "Usa /modelos para escanear y ver solo los modelos disponibles, o /modelo <nombre> para fijar uno."
+            f"Modelo actual: {actual}\n\n"
+            "Usa /modelos para ver solo los modelos disponibles, o /modelo <nombre> para fijar uno."
         )
         return
 
@@ -451,13 +471,6 @@ async def cmd_modelo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.set_global_setting("gemini_model", "")
         await update.message.reply_text(
             f"Listo, Cristian. Volví al modelo por defecto: {DEFAULT_GEMINI_MODEL}."
-        )
-        return
-
-    available = get_cached_available_models() or await scan_available_gemini_models(verify_ping=False)
-    if available and nuevo_modelo not in available:
-        await update.message.reply_text(
-            f"⚠️ El modelo {nuevo_modelo} no figura como disponible en tu API. Usa /modelos para ver solo los disponibles."
         )
         return
 
