@@ -18,15 +18,30 @@ PORT = int(os.environ.get("PORT", 10000))
 raw_creator_id = os.environ.get("CRISTIAN_USER_ID", "").strip()
 CRISTIAN_USER_ID = int(raw_creator_id) if raw_creator_id.isdigit() else None
 
+DEFAULT_GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+
 ALLOWED_REACTIONS = {"👍", "❤️", "🔥", "😂", "😮", "😢", "👏", "🤔", "👀", "💯", "🎉", "🫡"}
 
 STICKER_CATALOG: dict[str, str] = {}
 STICKER_META: dict[str, str] = {}
+AVAILABLE_GEMINI_MODELS: list[str] = []
 
 # chat_id -> {"expires_at": float, "key": str | None, "mode": "single" | "pack"}
 sticker_capture_sessions: dict[int, dict] = {}
 
 client = genai.Client(api_key=GEMINI_API_KEY)
+
+
+def log_error(context_tag: str, err: Exception | str):
+    """Registra errores en los logs de Render de forma visible."""
+    print(f"[ERROR - {context_tag}]: {err}", flush=True)
+
+
+def format_short_error(err: Exception | str, max_len: int = 240) -> str:
+    msg = " ".join(str(err).splitlines()).strip()
+    if len(msg) > max_len:
+        return msg[: max_len - 3] + "..."
+    return msg or "Error desconocido"
 
 
 def is_auto_fav_enabled() -> bool:
@@ -37,6 +52,123 @@ def is_auto_fav_enabled() -> bool:
 def is_auto_group_stickers_enabled() -> bool:
     val = db.get_global_setting("auto_group_stickers", "true")
     return str(val).lower() in ("1", "true", "on", "yes", "si")
+
+
+def get_active_gemini_model() -> str:
+    saved = (db.get_global_setting("gemini_model", "") or "").strip()
+    return saved if saved else DEFAULT_GEMINI_MODEL
+
+
+def _normalize_model_name(raw_name: str | None) -> str:
+    if not raw_name:
+        return ""
+    name = raw_name.strip()
+    if name.startswith("models/"):
+        name = name.split("/", 1)[1]
+    return name.strip()
+
+
+def _supports_content_generation(model_obj) -> bool:
+    """Verifica si el modelo soporta generación de contenido y excluye modelos no estándar."""
+    supported_actions = (
+        getattr(model_obj, "supported_actions", None)
+        or getattr(model_obj, "supported_generation_methods", None)
+        or []
+    )
+    normalized_actions = {str(a).lower().replace("_", "") for a in supported_actions}
+
+    if normalized_actions:
+        if not any("generatecontent" in act for act in normalized_actions):
+            return False
+
+    short_name = _normalize_model_name(getattr(model_obj, "name", "")).lower()
+    if not short_name:
+        return False
+
+    excluded_tokens = ("embedding", "imagen", "veo", "aqa", "tts", "live")
+    if any(tok in short_name for tok in excluded_tokens):
+        return False
+
+    return True
+
+
+async def scan_available_gemini_models(verify_ping: bool = False) -> list[str]:
+    """Escanea los modelos de la API y conserva solo los disponibles."""
+    discovered: list[str] = []
+    seen: set[str] = set()
+
+    try:
+        pager = await client.aio.models.list()
+        async for m in pager:
+            if not _supports_content_generation(m):
+                continue
+            model_id = _normalize_model_name(getattr(m, "name", ""))
+            if model_id and model_id not in seen:
+                seen.add(model_id)
+                discovered.append(model_id)
+    except Exception as e_async:
+        log_error("scan_models.aio", e_async)
+        try:
+            for m in client.models.list():
+                if not _supports_content_generation(m):
+                    continue
+                model_id = _normalize_model_name(getattr(m, "name", ""))
+                if model_id and model_id not in seen:
+                    seen.add(model_id)
+                    discovered.append(model_id)
+        except Exception as e_sync:
+            log_error("scan_models.sync", e_sync)
+            discovered = []
+
+    def sort_key(name: str):
+        is_gemini = 0 if name.startswith("gemini-") else 1
+        flash_rank = 0 if "flash" in name else (1 if "pro" in name else 2)
+        return (is_gemini, flash_rank, name)
+
+    discovered.sort(key=sort_key)
+
+    if verify_ping and discovered:
+        verified: list[str] = []
+        for candidate in discovered[:20]:
+            try:
+                await client.aio.models.generate_content(
+                    model=candidate,
+                    contents="responde solo OK",
+                    config=types.GenerateContentConfig(max_output_tokens=8, temperature=0.0),
+                )
+                verified.append(candidate)
+            except Exception as e_ping:
+                log_error(f"ping_model:{candidate}", e_ping)
+                continue
+        if verified:
+            discovered = verified
+
+    AVAILABLE_GEMINI_MODELS.clear()
+    AVAILABLE_GEMINI_MODELS.extend(discovered)
+
+    try:
+        db.set_global_setting("available_gemini_models", json.dumps(discovered))
+    except Exception as e_db:
+        log_error("save_cached_models", e_db)
+
+    return list(discovered)
+
+
+def get_cached_available_models() -> list[str]:
+    if AVAILABLE_GEMINI_MODELS:
+        return list(AVAILABLE_GEMINI_MODELS)
+    raw = (db.get_global_setting("available_gemini_models", "") or "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                cleaned = [_normalize_model_name(x) for x in parsed if isinstance(x, str) and _normalize_model_name(x)]
+                AVAILABLE_GEMINI_MODELS.clear()
+                AVAILABLE_GEMINI_MODELS.extend(cleaned)
+                return list(cleaned)
+        except Exception as e_parse:
+            log_error("get_cached_models", e_parse)
+    return []
 
 
 def refresh_sticker_catalog():
@@ -54,8 +186,8 @@ def refresh_sticker_catalog():
                         clean_k = k.strip().lower().replace(" ", "_")
                         merged_ids[clean_k] = v.strip()
                         merged_meta[clean_k] = "catálogo env"
-        except Exception:
-            pass
+        except Exception as e_json:
+            log_error("STICKERS_JSON", e_json)
 
     try:
         db_rows = db.get_all_stickers_detailed()
@@ -66,8 +198,8 @@ def refresh_sticker_catalog():
             desc = (row.get("description") or "").strip()
             label_parts = [p for p in (emoji, desc) if p]
             merged_meta[k] = " | ".join(label_parts) if label_parts else "guardado"
-    except Exception:
-        pass
+    except Exception as e_db:
+        log_error("refresh_sticker_catalog", e_db)
 
     STICKER_CATALOG.clear()
     STICKER_CATALOG.update(merged_ids)
@@ -193,24 +325,20 @@ async def cmd_ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mensaje = (
             "Guía de comandos de Jaison (Modo Creador - Cristian):\n\n"
             "• /ayuda o /help — Muestra esta lista de comandos y ejemplos de uso.\n"
-            "• /estado — Revisa modo del chat, mensajes observados, stickers guardados y ajustes automáticos.\n"
+            "• /estado — Revisa modo del chat, modelo activo, mensajes observados, stickers y ajustes.\n"
+            "• /modelos — Escanea y muestra solo los modelos disponibles de la API; usa /modelos <número> para elegir uno.\n"
+            "  Ejemplos: /modelos  |  /modelos scan  |  /modelos 1\n"
+            "• /modelo <nombre|reset> — Cambia el modelo activo directamente por nombre o vuelve al defecto.\n"
             "• /recuerdos — Lista los recuerdos guardados en la base de datos para este chat.\n"
-            "  Ejemplo: /recuerdos\n"
             "• /olvidar <palabra> — Elimina de la memoria los recuerdos que contengan esa palabra o frase.\n"
-            "  Ejemplo: /olvidar pizza\n"
-            "• /silencio — Pone a Jaison en modo observación en este chat (solo responderá con texto si lo llaman por nombre/mención o si se meten contigo).\n"
+            "• /silencio — Pone a Jaison en modo observación en este chat.\n"
             "• /hablar — Devuelve a Jaison su participación autónoma normal en este chat.\n"
             "• /idsticker [clave] — Captura el próximo sticker enviado en 2 minutos; si indicas clave, lo guarda en PostgreSQL al instante.\n"
-            "  Ejemplo: /idsticker risa\n"
             "• /pack o /importarpack — En los próximos 2 minutos, envíame un sticker de cualquier pack y guardaré TODO el pack en PostgreSQL.\n"
-            "  Ejemplo: /pack\n"
-            f"• /autofav <on|off> — Activa o desactiva guardar automáticamente los stickers que tú envías como favoritos (actualmente: {autofav_estado}).\n"
-            "  Ejemplo: /autofav off\n"
-            f"• /autogrupo <on|off> — Activa o desactiva que Jaison guarde por su cuenta stickers que le gusten en los chats (actualmente: {autogrupo_estado}).\n"
-            "  Ejemplo: /autogrupo on\n"
+            f"• /autofav <on|off> — Activa o desactiva guardar automáticamente tus stickers favoritos (actualmente: {autofav_estado}).\n"
+            f"• /autogrupo <on|off> — Activa o desactiva que Jaison guarde por su cuenta stickers que le gusten (actualmente: {autogrupo_estado}).\n"
             "• /stickers — Muestra las claves de stickers activas.\n"
-            "• /borrarsticker <clave> — Borra una clave de sticker de PostgreSQL.\n"
-            "  Ejemplo: /borrarsticker fav_cristian_1"
+            "• /borrarsticker <clave> — Borra una clave de sticker de PostgreSQL."
         )
     else:
         mensaje = (
@@ -219,6 +347,100 @@ async def cmd_ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     await update.message.reply_text(mensaje)
+
+
+async def cmd_modelos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not is_creator_user(update.effective_user.id):
+        return
+
+    args = [a.strip() for a in (context.args or []) if a.strip()]
+
+    if len(args) == 1 and args[0].isdigit():
+        idx = int(args[0]) - 1
+        models = get_cached_available_models()
+        if not models:
+            models = await scan_available_gemini_models(verify_ping=False)
+        if idx < 0 or idx >= len(models):
+            await update.message.reply_text(
+                f"Número fuera de rango. Usa `/modelos` para ver la lista del `1` al `{len(models)}`.",
+                parse_mode="Markdown",
+            )
+            return
+        elegido = models[idx]
+        db.set_global_setting("gemini_model", elegido)
+        await update.message.reply_text(
+            f"Listo, Cristian. Modelo cambiado a `{elegido}`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    force_scan = len(args) > 0 and args[0].lower() in ("scan", "escanear", "refresh", "actualizar")
+    verify_live = len(args) > 1 and args[1].lower() in ("check", "ping", "test", "verificar")
+
+    models = get_cached_available_models()
+    if force_scan or not models:
+        await update.message.reply_text("Escaneando modelos disponibles de la API...")
+        models = await scan_available_gemini_models(verify_ping=verify_live)
+
+    if not models:
+        await update.message.reply_text(
+            "⚠️ Error al escanear modelos: no encontré modelos disponibles o hubo un fallo con `GEMINI_API_KEY`. Revisa los logs de Render.",
+            parse_mode="Markdown",
+        )
+        return
+
+    activo = get_active_gemini_model()
+    lineas = []
+    for i, m in enumerate(models, start=1):
+        marca = "  <-- ACTIVO" if m == activo else ""
+        lineas.append(f"{i}. `{m}`{marca}")
+
+    listado = "\n".join(lineas)
+    await update.message.reply_text(
+        f"Modelos disponibles ({len(models)}):\n\n{listado}\n\n"
+        "Para elegir uno: `/modelos <número>` (ej. `/modelos 1`)\n"
+        "Para reescanear: `/modelos scan`",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_modelo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not is_creator_user(update.effective_user.id):
+        return
+
+    actual = get_active_gemini_model()
+
+    if not context.args:
+        await update.message.reply_text(
+            f"Modelo actual de Gemini: `{actual}`\n\n"
+            "Usa `/modelos` para escanear y ver solo los modelos disponibles, o `/modelo <nombre>` para fijar uno.",
+            parse_mode="Markdown",
+        )
+        return
+
+    nuevo_modelo = _normalize_model_name(" ".join(context.args))
+
+    if nuevo_modelo.lower() in ("reset", "default", "defecto"):
+        db.set_global_setting("gemini_model", "")
+        await update.message.reply_text(
+            f"Listo, Cristian. Volví al modelo por defecto: `{DEFAULT_GEMINI_MODEL}`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    available = get_cached_available_models() or await scan_available_gemini_models(verify_ping=False)
+    if available and nuevo_modelo not in available:
+        await update.message.reply_text(
+            f"⚠️ El modelo `{nuevo_modelo}` no figura como disponible en tu API. Usa `/modelos` para ver solo los disponibles.",
+            parse_mode="Markdown",
+        )
+        return
+
+    db.set_global_setting("gemini_model", nuevo_modelo)
+    await update.message.reply_text(
+        f"Listo, Cristian. Cambié el modelo a `{nuevo_modelo}`.",
+        parse_mode="Markdown",
+    )
 
 
 async def cmd_recuerdos(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -273,6 +495,7 @@ async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Estado en este chat:\n"
         f"• Modo: {modo}\n"
+        f"• Modelo activo: {get_active_gemini_model()}\n"
         f"• Mensajes observados en historial: {total_msgs}\n"
         f"• Stickers guardados: {len(STICKER_CATALOG)}\n"
         f"• Autoguardado favoritos de Cristian: {autofav}\n"
@@ -436,9 +659,11 @@ Responde SIEMPRE en JSON estricto:
 }}
 """
 
+    active_model = get_active_gemini_model()
+
     try:
         response = await client.aio.models.generate_content(
-            model="gemini-2.5-flash",
+            model=active_model,
             contents=eval_prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -446,7 +671,8 @@ Responde SIEMPRE en JSON estricto:
             ),
         )
         verdict = json.loads(response.text)
-    except Exception:
+    except Exception as e:
+        log_error(f"maybe_save_liked_sticker ({active_model})", e)
         return
 
     if bool(verdict.get("like_sticker")):
@@ -501,10 +727,11 @@ HISTORIAL OBSERVADO DEL CHAT (Últimos {len(history)} mensajes — revisa tus me
 """
 
     system_prompt = build_system_prompt()
+    active_model = get_active_gemini_model()
 
     try:
         response = await client.aio.models.generate_content(
-            model="gemini-2.5-flash",
+            model=active_model,
             contents=prompt,
             config=types.GenerateContentConfig(
                 system_instruction=system_prompt,
@@ -512,12 +739,24 @@ HISTORIAL OBSERVADO DEL CHAT (Últimos {len(history)} mensajes — revisa tus me
                 temperature=0.8,
             ),
         )
-        decision = json.loads(response.text)
-    except Exception:
+        raw_out = (response.text or "").strip()
+        decision = json.loads(raw_out)
+    except Exception as e:
+        log_error(f"analyze_and_act ({active_model})", e)
+        short_err = format_short_error(e)
+        if is_creator or is_mentioned or chat_type == "private":
+            return (
+                f"⚠️ Tuve un error al consultar el modelo `{active_model}`: {short_err}",
+                None,
+                None,
+            )
         return None, None, None
 
     if decision.get("new_memory"):
-        db.save_memory(chat_id, decision["new_memory"])
+        try:
+            db.save_memory(chat_id, decision["new_memory"])
+        except Exception as e_mem:
+            log_error("save_memory", e_mem)
 
     emoji = decision.get("reaction_emoji")
     if emoji not in ALLOWED_REACTIONS:
@@ -530,6 +769,15 @@ HISTORIAL OBSERVADO DEL CHAT (Últimos {len(history)} mensajes — revisa tus me
 
     reply_text = (decision.get("reply_text") or "").strip()
     should_reply = bool(decision.get("should_reply"))
+
+    if is_mentioned and not reply_text:
+        msg_aviso = (
+            f"⚠️ Me llamaron, pero el modelo `{active_model}` no devolvió `reply_text` válido para responder."
+            if (is_creator or chat_type == "private")
+            else None
+        )
+        log_error("empty_reply_on_mention", f"model={active_model} decision={decision}")
+        return msg_aviso, emoji, sticker_key
 
     if is_mentioned and reply_text:
         return reply_text, emoji, sticker_key
@@ -552,137 +800,163 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     is_creator = is_creator_user(user.id) if user else False
 
-    # 1. Captura de sticker o pack completo si Cristian activó /idsticker o /pack
-    if is_creator and message.sticker and chat_id in sticker_capture_sessions:
-        session = sticker_capture_sessions.pop(chat_id)
-        now = asyncio.get_running_loop().time()
-        if now <= session["expires_at"]:
-            mode = session.get("mode", "single")
-            if mode == "pack":
-                set_name = message.sticker.set_name
-                if not set_name:
-                    await message.reply_text("Ese sticker no pertenece a un pack con nombre público; envíame otro sticker de un pack.")
-                    return
-                try:
-                    sticker_set = await context.bot.get_sticker_set(name=set_name)
-                    clean_pack = re.sub(r"[^a-z0-9_]+", "", set_name.lower())[:25] or "pack"
-                    imported_count = 0
-                    for idx, st in enumerate(sticker_set.stickers):
-                        st_key = f"pack_{clean_pack}_{idx}"
-                        db.upsert_sticker(
-                            sticker_key=st_key,
-                            file_id=st.file_id,
-                            emoji=st.emoji,
-                            description=f"pack:{set_name}",
+    try:
+        # 1. Captura de sticker o pack completo si Cristian activó /idsticker o /pack
+        if is_creator and message.sticker and chat_id in sticker_capture_sessions:
+            session = sticker_capture_sessions.pop(chat_id)
+            now = asyncio.get_running_loop().time()
+            if now <= session["expires_at"]:
+                mode = session.get("mode", "single")
+                if mode == "pack":
+                    set_name = message.sticker.set_name
+                    if not set_name:
+                        await message.reply_text("Ese sticker no pertenece a un pack con nombre público; envíame otro sticker de un pack.")
+                        return
+                    try:
+                        sticker_set = await context.bot.get_sticker_set(name=set_name)
+                        clean_pack = re.sub(r"[^a-z0-9_]+", "", set_name.lower())[:25] or "pack"
+                        imported_count = 0
+                        for idx, st in enumerate(sticker_set.stickers):
+                            st_key = f"pack_{clean_pack}_{idx}"
+                            db.upsert_sticker(
+                                sticker_key=st_key,
+                                file_id=st.file_id,
+                                emoji=st.emoji,
+                                description=f"pack:{set_name}",
+                            )
+                            imported_count += 1
+                        refresh_sticker_catalog()
+                        await message.reply_text(
+                            f"Listo, Cristian. Importé {imported_count} stickers del pack `{set_name}` a PostgreSQL y ya están activos.",
+                            parse_mode="Markdown",
                         )
-                        imported_count += 1
+                    except Exception as e:
+                        log_error("import_pack", e)
+                        await message.reply_text(f"⚠️ No pude importar el pack completo: {format_short_error(e)}")
+                    return
+
+                file_id = message.sticker.file_id
+                sticker_emoji = message.sticker.emoji or "sin emoji"
+                assigned_key = session.get("key")
+
+                if assigned_key:
+                    saved_key = db.upsert_sticker(assigned_key, file_id, message.sticker.emoji, description="manual")
                     refresh_sticker_catalog()
                     await message.reply_text(
-                        f"Listo, Cristian. Importé {imported_count} stickers del pack `{set_name}` a PostgreSQL y ya están activos.",
+                        f"Guardado en PostgreSQL como `{saved_key}` ({sticker_emoji}) y activo desde ya sin reiniciar Render.\n\n`file_id`:\n`{file_id}`",
                         parse_mode="Markdown",
                     )
-                except Exception as e:
-                    await message.reply_text(f"No pude importar el pack completo ({e}).")
+                else:
+                    await message.reply_text(
+                        f"Sticker detectado ({sticker_emoji}):\n\n`file_id`:\n`{file_id}`\n\nPara guardarlo directo en PostgreSQL, usa `/idsticker <clave>` y luego envíalo.",
+                        parse_mode="Markdown",
+                    )
                 return
 
-            file_id = message.sticker.file_id
-            sticker_emoji = message.sticker.emoji or "sin emoji"
-            assigned_key = session.get("key")
-
-            if assigned_key:
-                saved_key = db.upsert_sticker(assigned_key, file_id, message.sticker.emoji, description="manual")
+        # 2. Autoguardado de stickers favoritos cuando Cristian envía un sticker en el chat
+        if is_creator and message.sticker and is_auto_fav_enabled():
+            existing = db.get_sticker_by_file_id(message.sticker.file_id)
+            if not existing:
+                fav_key = db.next_favorite_key()
+                db.upsert_sticker(
+                    sticker_key=fav_key,
+                    file_id=message.sticker.file_id,
+                    emoji=message.sticker.emoji,
+                    description="favorito_cristian",
+                )
                 refresh_sticker_catalog()
-                await message.reply_text(
-                    f"Guardado en PostgreSQL como `{saved_key}` ({sticker_emoji}) y activo desde ya sin reiniciar Render.\n\n`file_id`:\n`{file_id}`",
-                    parse_mode="Markdown",
-                )
-            else:
-                await message.reply_text(
-                    f"Sticker detectado ({sticker_emoji}):\n\n`file_id`:\n`{file_id}`\n\nPara guardarlo directo en PostgreSQL, usa `/idsticker <clave>` y luego envíalo.",
-                    parse_mode="Markdown",
-                )
+
+        content = extract_message_content(message)
+        if not content:
             return
 
-    # 2. Autoguardado de stickers favoritos cuando Cristian envía un sticker en el chat
-    if is_creator and message.sticker and is_auto_fav_enabled():
-        existing = db.get_sticker_by_file_id(message.sticker.file_id)
-        if not existing:
-            fav_key = db.next_favorite_key()
-            db.upsert_sticker(
-                sticker_key=fav_key,
-                file_id=message.sticker.file_id,
-                emoji=message.sticker.emoji,
-                description="favorito_cristian",
+        chat_type = update.effective_chat.type
+        username = "Cristian" if is_creator else ((user.first_name or user.username or "Usuario") if user else "Usuario")
+        bot_username = context.bot.username
+
+        db.seed_default_memories(chat_id)
+        db.save_message(chat_id, user.id if user else 0, username, content, is_bot=False)
+
+        if message.sticker and not is_creator:
+            asyncio.create_task(
+                maybe_save_liked_sticker(chat_id, chat_type, username, message.sticker)
             )
-            refresh_sticker_catalog()
 
-    content = extract_message_content(message)
-    if not content:
-        return
+        content_lower = content.lower()
+        is_mentioned = (
+            (bot_username and f"@{bot_username.lower()}" in content_lower)
+            or ("jaison" in content_lower)
+            or (message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.id == context.bot.id)
+        )
+        mentions_cristian = ("cristian" in content_lower) or ("christian" in content_lower)
+        silent_mode = db.is_silent_mode(chat_id)
 
-    chat_type = update.effective_chat.type
-    username = "Cristian" if is_creator else ((user.first_name or user.username or "Usuario") if user else "Usuario")
-    bot_username = context.bot.username
-
-    db.seed_default_memories(chat_id)
-    db.save_message(chat_id, user.id if user else 0, username, content, is_bot=False)
-
-    # 3. Evaluación autónoma de stickers que le gusten a Jaison en el chat
-    if message.sticker and not is_creator:
-        asyncio.create_task(
-            maybe_save_liked_sticker(chat_id, chat_type, username, message.sticker)
+        reply, emoji, sticker_key = await analyze_and_act(
+            chat_id,
+            chat_type,
+            username,
+            is_creator,
+            content,
+            is_mentioned,
+            mentions_cristian,
+            silent_mode,
         )
 
-    content_lower = content.lower()
-    is_mentioned = (
-        (bot_username and f"@{bot_username.lower()}" in content_lower)
-        or ("jaison" in content_lower)
-        or (message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.id == context.bot.id)
-    )
-    mentions_cristian = ("cristian" in content_lower) or ("christian" in content_lower)
-    silent_mode = db.is_silent_mode(chat_id)
+        if emoji:
+            try:
+                await asyncio.sleep(random.uniform(0.8, 2.0))
+                await message.set_reaction(reaction=[ReactionTypeEmoji(emoji=emoji)])
+            except Exception as e_react:
+                log_error("set_reaction", e_react)
 
-    reply, emoji, sticker_key = await analyze_and_act(
-        chat_id,
-        chat_type,
-        username,
-        is_creator,
-        content,
-        is_mentioned,
-        mentions_cristian,
-        silent_mode,
-    )
+        if reply:
+            delay = calculate_typing_delay(reply)
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            elapsed = 0.0
+            step = 2.0
+            while elapsed < delay:
+                sleep_time = min(step, delay - elapsed)
+                await asyncio.sleep(sleep_time)
+                elapsed += sleep_time
+                if elapsed < delay:
+                    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
-    if emoji:
+            try:
+                await message.reply_text(reply)
+            except Exception as e_send:
+                log_error("reply_text", e_send)
+                if is_creator or chat_type == "private":
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"⚠️ Error al enviar la respuesta en Telegram: {format_short_error(e_send)}",
+                    )
+                return
+
+            db.save_message(chat_id, context.bot.id, "Jaison", reply, is_bot=True)
+
+        if sticker_key and sticker_key in STICKER_CATALOG:
+            try:
+                await asyncio.sleep(random.uniform(1.2, 2.5))
+                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.CHOOSE_STICKER)
+                await asyncio.sleep(random.uniform(0.8, 1.5))
+                file_id = STICKER_CATALOG[sticker_key]
+                await message.reply_sticker(sticker=file_id)
+                db.save_message(chat_id, context.bot.id, "Jaison", f"[Sticker enviado: {sticker_key}]", is_bot=True)
+            except Exception as e_stk:
+                log_error(f"reply_sticker:{sticker_key}", e_stk)
+                if is_creator or chat_type == "private":
+                    await message.reply_text(
+                        f"⚠️ No pude enviar el sticker `{sticker_key}`: {format_short_error(e_stk)}",
+                        parse_mode="Markdown",
+                    )
+
+    except Exception as e_top:
+        log_error("handle_message", e_top)
         try:
-            await asyncio.sleep(random.uniform(0.8, 2.0))
-            await message.set_reaction(reaction=[ReactionTypeEmoji(emoji=emoji)])
-        except Exception:
-            pass
-
-    if reply:
-        delay = calculate_typing_delay(reply)
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-        elapsed = 0.0
-        step = 2.0
-        while elapsed < delay:
-            sleep_time = min(step, delay - elapsed)
-            await asyncio.sleep(sleep_time)
-            elapsed += sleep_time
-            if elapsed < delay:
-                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-
-        await message.reply_text(reply)
-        db.save_message(chat_id, context.bot.id, "Jaison", reply, is_bot=True)
-
-    if sticker_key and sticker_key in STICKER_CATALOG:
-        try:
-            await asyncio.sleep(random.uniform(1.2, 2.5))
-            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.CHOOSE_STICKER)
-            await asyncio.sleep(random.uniform(0.8, 1.5))
-            file_id = STICKER_CATALOG[sticker_key]
-            await message.reply_sticker(sticker=file_id)
-            db.save_message(chat_id, context.bot.id, "Jaison", f"[Sticker enviado: {sticker_key}]", is_bot=True)
+            if is_creator or (update.effective_chat and update.effective_chat.type == "private"):
+                await message.reply_text(
+                    f"⚠️ Ocurrió un error interno al procesar el mensaje: {format_short_error(e_top)}"
+                )
         except Exception:
             pass
 
@@ -708,6 +982,8 @@ async def main():
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
     application.add_handler(CommandHandler(["ayuda", "help"], cmd_ayuda))
+    application.add_handler(CommandHandler(["modelos", "models"], cmd_modelos))
+    application.add_handler(CommandHandler(["modelo", "model"], cmd_modelo))
     application.add_handler(CommandHandler("recuerdos", cmd_recuerdos))
     application.add_handler(CommandHandler("olvidar", cmd_olvidar))
     application.add_handler(CommandHandler("silencio", cmd_silencio))
