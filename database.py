@@ -48,7 +48,18 @@ def init_db():
             sticker_key TEXT PRIMARY KEY,
             file_id TEXT NOT NULL,
             emoji TEXT,
+            description TEXT,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    cur.execute("""
+        ALTER TABLE agent_stickers
+        ADD COLUMN IF NOT EXISTS description TEXT;
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS bot_global_settings (
+            setting_key TEXT PRIMARY KEY,
+            setting_value TEXT NOT NULL
         );
     """)
     cur.execute("""
@@ -58,6 +69,30 @@ def init_db():
     conn.commit()
     cur.close()
     conn.close()
+
+
+def set_global_setting(key: str, value: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO bot_global_settings (setting_key, setting_value)
+        VALUES (%s, %s)
+        ON CONFLICT (setting_key)
+        DO UPDATE SET setting_value = EXCLUDED.setting_value
+    """, (key, value))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def get_global_setting(key: str, default: str | None = None) -> str | None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT setting_value FROM bot_global_settings WHERE setting_key = %s", (key,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row["setting_value"] if row else default
 
 
 def seed_default_memories(chat_id: int):
@@ -187,30 +222,71 @@ def is_silent_mode(chat_id: int) -> bool:
     return bool(row["silent_mode"]) if row else False
 
 
-def upsert_sticker(sticker_key: str, file_id: str, emoji: str | None = None):
+def upsert_sticker(
+    sticker_key: str,
+    file_id: str,
+    emoji: str | None = None,
+    description: str | None = None,
+):
     clean_key = sticker_key.strip().lower().replace(" ", "_")
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO agent_stickers (sticker_key, file_id, emoji, updated_at)
-        VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+        INSERT INTO agent_stickers (sticker_key, file_id, emoji, description, updated_at)
+        VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
         ON CONFLICT (sticker_key)
-        DO UPDATE SET file_id = EXCLUDED.file_id, emoji = EXCLUDED.emoji, updated_at = CURRENT_TIMESTAMP
-    """, (clean_key, file_id.strip(), emoji))
+        DO UPDATE SET
+            file_id = EXCLUDED.file_id,
+            emoji = EXCLUDED.emoji,
+            description = COALESCE(EXCLUDED.description, agent_stickers.description),
+            updated_at = CURRENT_TIMESTAMP
+    """, (clean_key, file_id.strip(), emoji, description))
     conn.commit()
     cur.close()
     conn.close()
     return clean_key
 
 
-def get_all_stickers() -> dict[str, str]:
+def get_sticker_by_file_id(file_id: str) -> dict | None:
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT sticker_key, file_id FROM agent_stickers ORDER BY sticker_key ASC")
+    cur.execute("SELECT sticker_key, file_id, emoji, description FROM agent_stickers WHERE file_id = %s LIMIT 1", (file_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return dict(row) if row else None
+
+
+def next_favorite_key() -> str:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT sticker_key FROM agent_stickers WHERE sticker_key LIKE 'fav_cristian_%%'")
     rows = cur.fetchall()
     cur.close()
     conn.close()
-    return {r["sticker_key"]: r["file_id"] for r in rows}
+    used_nums = set()
+    for r in rows:
+        parts = r["sticker_key"].rsplit("_", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            used_nums.add(int(parts[1]))
+    n = 1
+    while n in used_nums:
+        n += 1
+    return f"fav_cristian_{n}"
+
+
+def get_all_stickers_detailed() -> list[dict]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT sticker_key, file_id, emoji, description FROM agent_stickers ORDER BY sticker_key ASC")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_all_stickers() -> dict[str, str]:
+    return {r["sticker_key"]: r["file_id"] for r in get_all_stickers_detailed()}
 
 
 def delete_sticker(sticker_key: str) -> bool:
@@ -223,3 +299,35 @@ def delete_sticker(sticker_key: str) -> bool:
     cur.close()
     conn.close()
     return deleted
+
+def count_group_liked_stickers() -> int:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COUNT(*) AS total FROM agent_stickers WHERE description LIKE 'gusto_grupo%%'"
+    )
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row["total"] if row else 0
+
+
+def next_group_sticker_key(tag: str = "gusto") -> str:
+    clean_tag = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in (tag or "gusto").lower()).strip("_")[:18] or "gusto"
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT sticker_key FROM agent_stickers WHERE sticker_key LIKE 'grupo_%%'")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    used_nums = set()
+    for r in rows:
+        parts = r["sticker_key"].rsplit("_", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            used_nums.add(int(parts[1]))
+
+    n = 1
+    while n in used_nums:
+        n += 1
+    return f"grupo_{clean_tag}_{n}"
