@@ -19,15 +19,13 @@ PORT = int(os.environ.get("PORT", 10000))
 raw_creator_id = os.environ.get("CRISTIAN_USER_ID", "").strip()
 CRISTIAN_USER_ID = int(raw_creator_id) if raw_creator_id.isdigit() else None
 
-DEFAULT_GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-4-hydrogen").strip() or "gemini-4-hydrogen"
+# Modelo principal: gemini-3.5-flash-lite
+DEFAULT_GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite").strip() or "gemini-3.5-flash-lite"
 
 FALLBACK_GEMINI_MODELS = [
-    "gemini-4-hydrogen",
-    "gemini-3.8-flash",
     "gemini-3.5-flash-lite",
-    "gemini-4-neon",
-    "gemini-4-argon",
-    "gemini-4-carbon",
+    "gemini-3.8-flash",
+    "gemini-4-hydrogen",
 ]
 
 ALLOWED_REACTIONS = {"👍", "❤️", "🔥", "😂", "😮", "😢", "👏", "🤔", "👀", "💯", "🎉", "🫡"}
@@ -134,7 +132,7 @@ async def _probe_models_availability(candidates: list[str]) -> list[str]:
 
 
 async def scan_available_gemini_models(verify_ping: bool = True) -> list[str]:
-    """Escanea los modelos de la API; si models.list da 501 o falla, prueba los candidatos actuales y deja solo los disponibles."""
+    """Escanea los modelos; prioriza gemini-3.5-flash-lite y deja solo los disponibles."""
     LAST_SCAN_ERRORS.clear()
     discovered: list[str] = []
     seen: set[str] = set()
@@ -165,18 +163,20 @@ async def scan_available_gemini_models(verify_ping: bool = True) -> list[str]:
             list_failed = True
             log_error("scan_models.sync", e_sync)
 
+    def sort_key(name: str):
+        is_preferred = 0 if name == "gemini-3.5-flash-lite" else 1
+        is_flash_lite = 0 if "flash-lite" in name else 1
+        is_flash = 0 if "flash" in name else 1
+        return (is_preferred, is_flash_lite, is_flash, name)
+
     if list_failed or not discovered:
         candidates = list(dict.fromkeys([DEFAULT_GEMINI_MODEL] + FALLBACK_GEMINI_MODELS))
+        candidates.sort(key=sort_key)
         if verify_ping:
             discovered = await _probe_models_availability(candidates)
         else:
             discovered = candidates
     else:
-        def sort_key(name: str):
-            is_g4 = 0 if name.startswith("gemini-4") else (1 if name.startswith("gemini-3") else 2)
-            flash_rank = 0 if "hydrogen" in name or "flash" in name else (1 if "argon" in name or "neon" in name else 2)
-            return (is_g4, flash_rank, name)
-
         discovered.sort(key=sort_key)
         if verify_ping:
             verified = await _probe_models_availability(discovered[:20])
@@ -765,24 +765,43 @@ HISTORIAL OBSERVADO DEL CHAT (Últimos {len(history)} mensajes — revisa tus me
     system_prompt = build_system_prompt()
     active_model = get_active_gemini_model()
 
-    try:
-        response = await client.aio.models.generate_content(
-            model=active_model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                response_mime_type="application/json",
-                temperature=0.8,
-            ),
-        )
-        raw_out = (response.text or "").strip()
-        decision = json.loads(raw_out)
-    except Exception as e:
-        detalle = format_detailed_error(e, include_tb=True)
-        log_error(f"analyze_and_act ({active_model})", detalle)
+    # Reintento automático ante pico 503 pasando a los modelos de respaldo
+    models_to_try = list(dict.fromkeys([active_model] + FALLBACK_GEMINI_MODELS))
+    raw_out = ""
+    decision = None
+    last_err = None
+    used_model = active_model
+
+    for idx_m, candidate_model in enumerate(models_to_try):
+        used_model = candidate_model
+        try:
+            response = await client.aio.models.generate_content(
+                model=candidate_model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    response_mime_type="application/json",
+                    temperature=0.8,
+                ),
+            )
+            raw_out = (response.text or "").strip()
+            decision = json.loads(raw_out)
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+            err_str = str(e)
+            log_error(f"analyze_and_act ({candidate_model})", err_str)
+            if ("503" in err_str or "UNAVAILABLE" in err_str) and idx_m < len(models_to_try) - 1:
+                await asyncio.sleep(1.0)
+                continue
+            break
+
+    if last_err is not None or decision is None:
+        detalle = format_detailed_error(last_err or "Sin respuesta del modelo", include_tb=True)
         if is_creator or is_mentioned or chat_type == "private":
             return (
-                f"⚠️ Error al consultar el modelo {active_model}:\n{detalle}",
+                f"⚠️ Error al consultar el modelo {used_model}:\n{detalle}",
                 None,
                 None,
             )
@@ -808,11 +827,11 @@ HISTORIAL OBSERVADO DEL CHAT (Últimos {len(history)} mensajes — revisa tus me
 
     if is_mentioned and not reply_text:
         msg_aviso = (
-            f"⚠️ Me llamaron, pero el modelo {active_model} no devolvió reply_text válido:\n{raw_out[:1500]}"
+            f"⚠️ Me llamaron, pero el modelo {used_model} no devolvió reply_text válido:\n{raw_out[:1500]}"
             if (is_creator or chat_type == "private")
             else None
         )
-        log_error("empty_reply_on_mention", f"model={active_model} raw={raw_out}")
+        log_error("empty_reply_on_mention", f"model={used_model} raw={raw_out}")
         return msg_aviso, emoji, sticker_key
 
     if is_mentioned and reply_text:
